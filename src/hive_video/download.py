@@ -42,6 +42,7 @@ import math
 import os
 import re
 import shlex
+import socket
 import ssl
 import sys
 import tempfile
@@ -172,6 +173,8 @@ def _http_get(
     timeout: float,
     headers: dict[str, str] | None,
     ssl_context: ssl.SSLContext,
+    *,
+    operation: str = "archive request",
 ):
     if urllib.parse.urlparse(url).scheme.lower() != "https":
         raise ValueError("Refused a non-HTTPS archive request.")
@@ -183,6 +186,19 @@ def _http_get(
     try:
         return opener.open(request, timeout=timeout)
     except urllib.error.URLError as error:
+        if isinstance(error.reason, socket.gaierror):
+            # The opener may be resolving a redirect or proxy, not the original
+            # server. Omit URL credentials and queries (including signed URLs).
+            host = urllib.parse.urlparse(url).hostname
+            raise urllib.error.URLError(
+                f"DNS/name resolution failed during {operation} "
+                f"(requested host: {host!r}; socket.gaierror errno={error.reason.errno}). "
+                "The lookup may involve this server, a redirect destination, or a configured proxy. "
+                "Check DNS, network access, and proxy settings on the node running this command. "
+                "This is not a TLS certificate error; changing CA bundles will not fix it. "
+                "Use --probe-only --refresh-manifest to check archive and media access "
+                "without downloading the video."
+            ) from error
         if _is_certificate_verification_error(error):
             raise RuntimeError(
                 "TLS certificate verification failed for the Edmond archive. "
@@ -204,7 +220,7 @@ def fetch_manifest(
         f"{server}/api/datasets/:persistentId/versions/:latest/files"
         f"?persistentId={urllib.parse.quote(doi, safe=':.')}"
     )
-    with _http_get(url, timeout, None, ssl_context) as response:
+    with _http_get(url, timeout, None, ssl_context, operation="archive manifest") as response:
         payload = json.load(response)
     if payload.get("status") != "OK":
         raise RuntimeError(f"Dataverse API returned status {payload.get('status')!r} for {doi}")
@@ -370,7 +386,9 @@ def download(
 
         headers = {"Range": f"bytes={have}-"} if have else {}
         try:
-            with _http_get(url, timeout, headers, ssl_context) as response:
+            with _http_get(
+                url, timeout, headers, ssl_context, operation="media download"
+            ) as response:
                 if have and response.status != 206:
                     # Server ignored the range request; start over rather than corrupt.
                     _report(
@@ -426,7 +444,9 @@ def probe_download(
 ) -> None:
     """Verify the media endpoint and its redirects while reading only one byte."""
     url = f"{server}/api/access/datafile/{remote.file_id}"
-    with _http_get(url, timeout, {"Range": "bytes=0-0"}, ssl_context) as response:
+    with _http_get(
+        url, timeout, {"Range": "bytes=0-0"}, ssl_context, operation="media probe"
+    ) as response:
         status = getattr(response, "status", None)
         if status != 206:
             raise RuntimeError(

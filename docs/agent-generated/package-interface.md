@@ -75,6 +75,23 @@ hive-video download --locator start4_side1_top --target /data/raw
 
 Resolution may fetch the archive manifest; it does not download video. `--manifest-cache` selects an explicit cache, and `--resolve-only --format sh` retains the `RESEQ_*` assignments used by existing cluster scripts. Transfers retain resumable `.part` files, retry settings, and archive MD5 verification. The inherited downloader renames a byte-complete transfer before checking MD5; a checksum failure returns an error but can leave that destination present. A later call with verification enabled checks it again.
 
+### Download name-resolution failures (including Sol)
+
+`<urlopen error [Errno -2] Name or service not known>`, as reported in [issue #14](https://github.com/Collective-Logic-Lab/honeybee-hive-video/issues/14), is a network name-resolution failure. The preceding `TLS verification roots:` line reports which certificate roots were loaded; it does not mean an HTTPS connection succeeded. Changing the target directory or CA bundle does not fix a DNS lookup. Python reports these failures as [`socket.gaierror`](https://docs.python.org/3.12/library/socket.html#socket.gaierror); the error number and wording vary by platform.
+
+The working checkout now identifies whether the failure occurred during archive manifest retrieval, a media probe, or a media download, and reports the requested hostname. A redirect destination or configured proxy can be the host whose lookup failed, so the requested hostname alone does not establish the cause. TLS verification, media retry limits, and partial-file resume behavior are unchanged; manifest retrieval and probes still fail after one attempt.
+
+On the same node and in the same environment that failed, check the archive hostname and then run the small end-to-end probe:
+
+```bash
+python -c 'import socket; print(socket.getaddrinfo("edmond.mpg.de", 443, type=socket.SOCK_STREAM))'
+hive-video download --start 4 --side 0 --panel top --probe-only --refresh-manifest
+```
+
+The first command checks direct hostname resolution. The second refreshes the manifest cache and follows the actual media HTTPS redirects using a one-byte range request; it creates no video or target directory. Refreshing matters because a cached `--resolve-only` result does not test the archive connection. A successful direct lookup does not check redirect hosts or proxies; urllib can use [proxy settings from the environment or operating system](https://docs.python.org/3.12/library/urllib.request.html#urllib.request.ProxyHandler).
+
+If this still fails on Sol, record the hostname, whether it is a login node or a Slurm allocation, the package version (`hive-video --version`), and the diagnostic error. Check the network and proxy configuration for that node with the cluster support team. Keep proxy credentials and signed media URLs out of shared logs. A successful probe establishes connectivity at that time; it does not guarantee an uninterrupted full transfer. After it succeeds, rerun the original download command to resume any partial file.
+
 ### Automatic resequencing (working checkout; awaiting release)
 
 Run the unattended 25 fps hive-video profile in a new output directory:

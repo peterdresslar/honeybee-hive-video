@@ -6,10 +6,12 @@ import io
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -148,7 +150,7 @@ class DownloadApiTests(unittest.TestCase):
             cache.write_text(json.dumps(manifest_entries(day22_file())))
             with (
                 mock.patch.object(
-                    download, "_http_get", side_effect=lambda *_: response(b"")
+                    download, "_http_get", side_effect=lambda *_, **__: response(b"")
                 ) as get,
                 self.assertRaisesRegex(RuntimeError, "after 8 attempts"),
             ):
@@ -540,8 +542,103 @@ class DownloadApiTests(unittest.TestCase):
             self.assertEqual(result.read_bytes(), PAYLOAD)
             self.assertEqual(get.call_args_list[1].args[2], {"Range": "bytes=4-"})
 
+    def test_media_dns_failure_retains_retry_and_resume_behavior(self) -> None:
+        dns_error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / FILENAME
+            part = destination.with_suffix(".mp4.part")
+            part.write_bytes(PAYLOAD[:4])
+            messages: list[str] = []
+            with (
+                mock.patch.object(download.urllib.request, "build_opener") as build_opener,
+                mock.patch.object(download.time, "sleep") as sleep,
+            ):
+                opener = build_opener.return_value
+                opener.open.side_effect = [dns_error, response(PAYLOAD[4:], 206)]
+                result = download.download_video(
+                    remote_file(), target=directory, retries=2, on_message=messages.append
+                )
+            self.assertEqual(result.read_bytes(), PAYLOAD)
+            self.assertFalse(part.exists())
+            self.assertEqual(opener.open.call_count, 2)
+            for call in opener.open.call_args_list:
+                self.assertEqual(call.args[0].get_header("Range"), "bytes=4-")
+            sleep.assert_called_once_with(2.0)
+            self.assertTrue(
+                any("DNS/name resolution failed during media download" in m for m in messages)
+            )
+            self.assertIn("MD5 OK", messages)
+
+    def test_exhausted_dns_retries_preserve_partial_without_completing(self) -> None:
+        dns_error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / FILENAME
+            part = destination.with_suffix(".mp4.part")
+            part.write_bytes(PAYLOAD[:4])
+            messages: list[str] = []
+            with (
+                mock.patch.object(download.urllib.request, "build_opener") as build_opener,
+                mock.patch.object(download.time, "sleep") as sleep,
+            ):
+                opener = build_opener.return_value
+                opener.open.side_effect = dns_error
+                with self.assertRaisesRegex(urllib.error.URLError, "during media download"):
+                    download.download_video(
+                        remote_file(), target=directory, retries=2, on_message=messages.append
+                    )
+            self.assertEqual(opener.open.call_count, 2)
+            sleep.assert_called_once_with(2.0)
+            self.assertEqual(part.read_bytes(), PAYLOAD[:4])
+            self.assertFalse(destination.exists())
+            self.assertFalse(any(m.startswith("done:") for m in messages))
+
 
 class DownloadCliTests(unittest.TestCase):
+    def test_dns_failures_identify_manifest_or_probe_and_return_nonzero(self) -> None:
+        for cached, mode, operation in (
+            (False, [], "archive manifest"),
+            (True, ["--resolve-only", "--refresh-manifest"], "archive manifest"),
+            (True, ["--probe-only"], "media probe"),
+        ):
+            with self.subTest(cached=cached, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                cache = root / "manifest.json"
+                target = root / "raw"
+                if cached:
+                    write_manifest(cache)
+                    original_cache = cache.read_bytes()
+                dns_error = urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+                with (
+                    mock.patch.object(download.urllib.request, "build_opener") as build_opener,
+                    mock.patch.object(download.time, "sleep") as sleep,
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    build_opener.return_value.open.side_effect = dns_error
+                    result = download.main(
+                        [
+                            "--locator",
+                            "start47_side1_top",
+                            "--target",
+                            str(target),
+                            "--manifest-cache",
+                            str(cache),
+                            *mode,
+                        ]
+                    )
+                self.assertEqual(result, 1)
+                self.assertIn(f"DNS/name resolution failed during {operation}", stderr.getvalue())
+                self.assertIn("edmond.mpg.de", stderr.getvalue())
+                self.assertIn("--probe-only --refresh-manifest", stderr.getvalue())
+                self.assertNotIn("probe OK", stdout.getvalue())
+                build_opener.return_value.open.assert_called_once()
+                sleep.assert_not_called()
+                self.assertFalse(target.exists())
+                if cached:
+                    self.assertEqual(cache.read_bytes(), original_cache)
+                else:
+                    self.assertFalse(cache.exists())
+
     def test_resolve_sh_contract_is_exact_and_does_not_mutate_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

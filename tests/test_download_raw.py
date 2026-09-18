@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import ssl
 import tempfile
 import time
@@ -115,6 +116,66 @@ class DownloadRawTests(unittest.TestCase):
                 ssl.create_default_context(),
             )
 
+    def test_dns_errors_report_request_context_without_url_secrets(self) -> None:
+        context = ssl.create_default_context()
+        for code, settings, operation in (
+            (socket.EAI_NONAME, {}, "archive request"),
+            (socket.EAI_AGAIN, {"operation": "media probe"}, "media probe"),
+        ):
+            error = download_raw.urllib.error.URLError(
+                socket.gaierror(code, "name resolution failed")
+            )
+            with (
+                self.subTest(code=code, operation=operation),
+                mock.patch.object(download_raw.urllib.request, "build_opener") as build_opener,
+            ):
+                build_opener.return_value.open.side_effect = error
+                with self.assertRaises(download_raw.urllib.error.URLError) as raised:
+                    download_raw._http_get(
+                        "https://secret-user:secret-password@example.invalid/private-object"
+                        "?X-Amz-Signature=secret-signature#secret-fragment",
+                        4,
+                        None,
+                        context,
+                        **settings,
+                    )
+                message = str(raised.exception)
+                self.assertIn(f"DNS/name resolution failed during {operation}", message)
+                self.assertIn("example.invalid", message)
+                self.assertIn(f"socket.gaierror errno={code}", message)
+                self.assertIn("proxy", message)
+                self.assertIs(raised.exception.__cause__, error)
+                for secret in (
+                    "secret-user",
+                    "secret-password",
+                    "private-object",
+                    "X-Amz-Signature",
+                    "secret-signature",
+                    "secret-fragment",
+                ):
+                    self.assertNotIn(secret, message)
+                build_opener.return_value.open.assert_called_once()
+
+    def test_other_network_errors_are_not_classified_as_dns_failures(self) -> None:
+        errors = (
+            download_raw.urllib.error.URLError(TimeoutError("timed out")),
+            download_raw.urllib.error.URLError(ConnectionRefusedError("connection refused")),
+            download_raw.urllib.error.HTTPError(
+                "https://example.invalid/video", 503, "Service unavailable", None, None
+            ),
+            TimeoutError("timed out"),
+        )
+        context = ssl.create_default_context()
+        for error in errors:
+            with (
+                self.subTest(error=error),
+                mock.patch.object(download_raw.urllib.request, "build_opener") as build_opener,
+            ):
+                build_opener.return_value.open.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    download_raw._http_get("https://example.invalid/video", 4, None, context)
+                self.assertIs(raised.exception, error)
+
     def test_probe_download_reads_only_one_byte(self) -> None:
         remote = download_raw.RemoteFile(
             file_id=237822,
@@ -141,6 +202,7 @@ class DownloadRawTests(unittest.TestCase):
             5,
             {"Range": "bytes=0-0"},
             context,
+            operation="media probe",
         )
         response.read.assert_called_once_with(1)
 
